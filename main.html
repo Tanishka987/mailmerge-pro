@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MailMerge Pro</title>
+    <link rel="icon" type="image/png" href="favicon.png">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/quill/1.3.7/quill.min.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/quill/1.3.7/quill.snow.min.css" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://apis.google.com/js/api.js"></script>
+    <script src="https://accounts.google.com/gsi/client"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div class="container">
+        <div class="title">
+            <img style="width:5%" src="favicon.png" alt="">
+            <h1>MailMerge Pro</h1>
+        </div>
+
+        <div class="auth-container">
+            <button id="auth-button">Authorize with Google</button>
+            <p id="auth-status">Not logged in</p>
+        </div>
+
+        <div class="tabs">
+            <div class="tab active" data-tab="spreadsheet">Google Spreadsheet</div>
+            <div class="tab" data-tab="csv">CSV Upload</div>
+        </div>
+
+        <div class="tab-content active" id="spreadsheet-tab">
+            <div class="form-group">
+                <label for="spreadsheet-id">Google Spreadsheet ID:</label>
+                <input type="text" id="spreadsheet-id" placeholder="Enter spreadsheet ID from URL...">
+                <p><small>Find the ID in the URL: https://docs.google.com/spreadsheets/d/[THIS-IS-THE-ID]/edit</small>
+                </p>
+            </div>
+            <button id="load-spreadsheet">Load Recipients</button>
+        </div>
+
+        <div class="tab-content" id="csv-tab">
+            <div class="form-group">
+                <label for="csv-file">Upload CSV File:</label>
+                <input type="file" id="csv-file" accept=".csv,.xlsx,.xls">
+                <p><small>File should have columns for 'name' and 'email'</small></p>
+            </div>
+            <button id="load-csv">Load Recipients from CSV</button>
+        </div>
+
+        <div id="recipient-container" style="display: none;">
+            <h3>Recipients</h3>
+            <div class="email-list" id="email-list"></div>
+            <p id="recipient-count">0 recipients loaded</p>
+        </div>
+
+        <div class="form-group">
+            <label for="subject">Email Subject:</label>
+            <input type="text" id="subject" placeholder="Enter email subject...">
+        </div>
+
+        <div class="form-group">
+            <label for="editor">Email Content:</label>
+            <div id="editor-container"></div>
+        </div>
+
+        <div class="button-container">
+            <div>
+                <button id="send-test">Send Test Email</button>
+                <input type="email" id="test-email" placeholder="test@example.com">
+            </div>
+            <button id="send-emails">Send to All Recipients</button>
+        </div>
+
+        <div class="progress-container" id="progress-container">
+            <div id="progress-bar">
+                <div id="progress-bar-fill"></div>
+            </div>
+            <p id="status">Preparing to send emails...</p>
+        </div>
+
+        <div id="preview" style="display: none;">
+            <div class="preview-header">Email Preview:</div>
+            <div id="preview-content"></div>
+        </div>
+    </div>
+
+    <script>
+        const CLIENT_ID = '874266376853-m38n610huhq1frp1jta8ppigm4h52mbc.apps.googleusercontent.com';
+        const API_KEY = 'AIzaSyDPbAaVKxpdHZ0TggFQr82cJcG2VKLO8SU';
+        const DISCOVERY_DOC = 'https://sheets.googleapis.com/$discovery/rest?version=v4';
+        const SCOPES = 'https://www.googleapis.com/auth/spreadsheets.readonly https://www.googleapis.com/auth/gmail.send';
+
+        let tokenClient;
+        let gapiInited = false;
+        let gisInited = false;
+        let isAuthorized = false;
+        let recipients = [];
+        let quill;
+
+        document.addEventListener('DOMContentLoaded', function () {
+            quill = new Quill('#editor-container', {
+                theme: 'snow',
+                modules: {
+                    toolbar: [
+                        [{ 'header': [1, 2, 3, false] }],
+                        ['bold', 'italic', 'underline', 'strike'],
+                        [{ 'color': [] }, { 'background': [] }],
+                        [{ 'list': 'ordered' }, { 'list': 'bullet' }],
+                        ['link', 'image', 'video'],
+                        ['clean']
+                    ]
+                },
+                placeholder: 'Compose your email message...'
+            });
+
+            document.getElementById('auth-button').addEventListener('click', handleAuthClick);
+            document.getElementById('load-spreadsheet').addEventListener('click', loadSpreadsheetData);
+            document.getElementById('load-csv').addEventListener('click', handleCsvUpload);
+            document.getElementById('send-test').addEventListener('click', sendTestEmail);
+            document.getElementById('send-emails').addEventListener('click', sendEmails);
+
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.addEventListener('click', function () {
+                    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+
+                    this.classList.add('active');
+
+                    const tabId = this.getAttribute('data-tab');
+                    document.getElementById(`${tabId}-tab`).classList.add('active');
+                });
+            });
+
+            initializeGapiClient();
+        });
+
+        async function initializeGapiClient() {
+            await new Promise((resolve) => {
+                gapi.load('client', resolve);
+            });
+
+            try {
+                await gapi.client.init({
+                    discoveryDocs: [DISCOVERY_DOC],
+                });
+                gapiInited = true;
+
+                tokenClient = google.accounts.oauth2.initTokenClient({
+                    client_id: CLIENT_ID,
+                    scope: SCOPES,
+                    callback: (tokenResponse) => {
+                        if (tokenResponse && !tokenResponse.error) {
+                            isAuthorized = true;
+                            gapi.client.setToken({ access_token: tokenResponse.access_token });
+                            document.getElementById('auth-status').textContent = 'Authorized';
+                            document.getElementById('auth-button').textContent = 'Refresh Authorization';
+                        }
+                    },
+                });
+
+                gisInited = true;
+            } catch (err) {
+                console.error('Error initializing GAPI client:', err);
+                document.getElementById('auth-status').textContent = 'Error: ' + err.message;
+            }
+        }
+
+        function handleAuthClick() {
+            if (!gapiInited || !gisInited) {
+                document.getElementById('auth-status').textContent = 'Still initializing...';
+                return;
+            }
+
+            tokenClient.requestAccessToken();
+        }
+
+        function checkForAuthToken() {
+            const hash = window.location.hash.substring(1);
+            const params = new URLSearchParams(hash);
+            const accessToken = params.get('access_token');
+
+            if (accessToken) {
+                document.getElementById('auth-status').textContent = 'Token received, authorizing...';
+                gapi.client.setToken({
+                    access_token: accessToken
+                });
+
+                isAuthorized = true;
+                document.getElementById('auth-status').textContent = 'Authorized';
+                document.getElementById('auth-button').textContent = 'Refresh Authorization';
+
+                window.history.replaceState({}, document.title, window.location.pathname);
+
+                const returnUrl = localStorage.getItem('email_sender_return_url');
+                if (returnUrl && returnUrl !== window.location.href) {
+                    window.location.href = returnUrl;
+                }
+            }
+        }
+
+        function handleAuthResult(authResult) {
+            if (authResult && !authResult.error) {
+                isAuthorized = true;
+                document.getElementById('auth-status').textContent = 'Authorized';
+                document.getElementById('auth-button').textContent = 'Refresh Authorization';
+            } else {
+                isAuthorized = false;
+                document.getElementById('auth-status').textContent = 'Not authorized';
+                document.getElementById('auth-button').textContent = 'Authorize with Google';
+
+                if (authResult) {
+                    console.error('Auth error:', authResult.error);
+                }
+            }
+        }
+        async function loadSpreadsheetData() {
+            if (!isAuthorized) {
+                alert('Please authorize with Google first.');
+                return;
+            }
+
+            const spreadsheetId = document.getElementById('spreadsheet-id').value.trim();
+            if (!spreadsheetId) {
+                alert('Please enter a valid spreadsheet ID.');
+                return;
+            }
+
+            try {
+                const sheetResponse = await gapi.client.sheets.spreadsheets.get({
+                    spreadsheetId: spreadsheetId
+                });
+
+                const firstSheetId = sheetResponse.result.sheets[0].properties.title;
+
+                const response = await gapi.client.sheets.spreadsheets.values.get({
+                    spreadsheetId: spreadsheetId,
+                    range: firstSheetId
+                });
+
+                const values = response.result.values;
+                if (!values || values.length === 0) {
+                    alert('No data found in the spreadsheet.');
+                    return;
+                }
+
+                const headers = values[0].map(header => header.toLowerCase());
+                const nameIndex = headers.indexOf('name');
+                const emailIndex = headers.indexOf('email');
+
+                if (emailIndex === -1) {
+                    alert('The spreadsheet must have an "email" column.');
+                    return;
+                }
+                recipients = [];
+                for (let i = 1; i < values.length; i++) {
+                    const row = values[i];
+                    if (row.length > emailIndex) {
+                        const email = row[emailIndex];
+                        const name = nameIndex >= 0 && row.length > nameIndex ? row[nameIndex] : '';
+
+                        if (email && validateEmail(email)) {
+                            recipients.push({ name, email });
+                        }
+                    }
+                }
+
+                displayRecipients(recipients);
+            } catch (err) {
+                console.error('Error loading spreadsheet data:', err);
+                alert('Error loading spreadsheet: ' + err.message);
+            }
+        }
+        function handleCsvUpload() {
+            const fileInput = document.getElementById('csv-file');
+            const file = fileInput.files[0];
+
+            if (!file) {
+                alert('Please select a file to upload.');
+                return;
+            }
+
+            const reader = new FileReader();
+
+            reader.onload = function (e) {
+                const data = e.target.result;
+                try {
+                    let parsedData;
+
+                    if (file.name.endsWith('.csv')) {
+                        parsedData = parseCSV(data);
+                    } else if (file.name.endsWith('.xlsx') || file.name.endsWith('.xls')) {
+                        const workbook = XLSX.read(data, { type: 'binary' });
+                        const firstSheet = workbook.SheetNames[0];
+                        const worksheet = workbook.Sheets[firstSheet];
+                        parsedData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+                    } else {
+                        alert('Unsupported file format. Please upload a CSV or Excel file.');
+                        return;
+                    }
+
+                    if (!parsedData || parsedData.length === 0) {
+                        alert('No data found in the file.');
+                        return;
+                    }
+
+                    const headers = parsedData[0].map(header => header.toLowerCase());
+                    const nameIndex = headers.indexOf('name');
+                    const emailIndex = headers.indexOf('email');
+
+                    if (emailIndex === -1) {
+                        alert('The file must have an "email" column.');
+                        return;
+                    }
+
+                    recipients = [];
+                    for (let i = 1; i < parsedData.length; i++) {
+                        const row = parsedData[i];
+                        if (row.length > emailIndex) {
+                            const email = row[emailIndex];
+                            const name = nameIndex >= 0 && row.length > nameIndex ? row[nameIndex] : '';
+
+                            if (email && validateEmail(email)) {
+                                recipients.push({ name, email });
+                            }
+                        }
+                    }
+
+                    displayRecipients(recipients);
+                } catch (err) {
+                    console.error('Error parsing file:', err);
+                    alert('Error parsing file: ' + err.message);
+                }
+            };
+
+            if (file.name.endsWith('.csv')) {
+                reader.readAsText(file);
+            } else {
+                reader.readAsBinaryString(file);
+            }
+        }
+
+        function parseCSV(csvData) {
+            const lines = csvData.split(/\r\n|\n/);
+            const result = [];
+
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i].trim();
+                if (line) {
+                    const regex = /(".*?"|[^",]+)(?=\s*,|\s*$)/g;
+                    const matches = [];
+                    let match;
+
+                    while ((match = regex.exec(line)) !== null) {
+                        let value = match[1];
+                        if (value.startsWith('"') && value.endsWith('"')) {
+                            value = value.substring(1, value.length - 1);
+                        }
+                        matches.push(value);
+                    }
+
+                    if (matches.length > 0) {
+                        result.push(matches);
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        function displayRecipients(recipients) {
+            const emailList = document.getElementById('email-list');
+            emailList.innerHTML = '';
+
+            if (recipients.length === 0) {
+                emailList.innerHTML = '<div class="email-item">No valid recipients found.</div>';
+            } else {
+                recipients.forEach(recipient => {
+                    const emailItem = document.createElement('div');
+                    emailItem.className = 'email-item';
+                    emailItem.textContent = recipient.name ? `${recipient.name} <${recipient.email}>` : recipient.email;
+                    emailList.appendChild(emailItem);
+                });
+            }
+
+            document.getElementById('recipient-count').textContent = `${recipients.length} recipients loaded`;
+            document.getElementById('recipient-container').style.display = 'block';
+        }
+
+        function sendTestEmail() {
+            const testEmail = document.getElementById('test-email').value.trim();
+            if (!testEmail || !validateEmail(testEmail)) {
+                alert('Please enter a valid test email address.');
+                return;
+            }
+
+            const subject = document.getElementById('subject').value.trim();
+            if (!subject) {
+                alert('Please enter an email subject.');
+                return;
+            }
+
+            const content = quill.root.innerHTML;
+            if (!content || quill.getText().trim() === '') {
+                alert('Please enter email content.');
+                return;
+            }
+
+            sendEmail([{ name: '', email: testEmail }], subject, content, true);
+        }
+
+        function sendEmails() {
+            if (!isAuthorized) {
+                alert('Please authorize with Google first.');
+                return;
+            }
+
+            if (recipients.length === 0) {
+                alert('Please load recipients first.');
+                return;
+            }
+
+            const subject = document.getElementById('subject').value.trim();
+            if (!subject) {
+                alert('Please enter an email subject.');
+                return;
+            }
+
+            const content = quill.root.innerHTML;
+            if (!content || quill.getText().trim() === '') {
+                alert('Please enter email content.');
+                return;
+            }
+
+            const confirmSend = confirm(`Are you sure you want to send this email to ${recipients.length} recipients?`);
+            if (confirmSend) {
+                sendEmail(recipients, subject, content, false);
+            }
+        }
+
+        async function sendEmail(recipients, subject, content, isTest) {
+            if (!isAuthorized) {
+                alert('Please authorize with Google first.');
+                return;
+            }
+
+            const progressContainer = document.getElementById('progress-container');
+            const progressBarFill = document.getElementById('progress-bar-fill');
+            const statusText = document.getElementById('status');
+
+            progressContainer.style.display = 'block';
+
+            await new Promise((resolve) => {
+                gapi.client.load('gmail', 'v1', resolve);
+            });
+
+            document.getElementById('preview').style.display = 'block';
+            document.getElementById('preview-content').innerHTML = `
+        <strong>Subject:</strong> ${subject}<br><br>
+        <div>${content}</div>
+    `;
+
+            try {
+                let successCount = 0;
+
+                for (let i = 0; i < recipients.length; i++) {
+                    const recipient = recipients[i];
+
+                    const emailLines = [
+                        'From: me',
+                        `To: ${recipient.name ? `${recipient.name} <${recipient.email}>` : recipient.email}`,
+                        `Subject: ${subject}`,
+                        'Content-Type: text/html; charset=utf-8',
+                        '',
+                        content
+                    ];
+
+                    const rawEmail = emailLines.join('\r\n');
+
+                    const encodedEmail = btoa(unescape(encodeURIComponent(rawEmail)))
+                        .replace(/\+/g, '-')
+                        .replace(/\//g, '_')
+                        .replace(/=+$/, '');
+
+                    try {
+                        await gapi.client.gmail.users.messages.send({
+                            userId: 'me',
+                            resource: {
+                                raw: encodedEmail
+                            }
+                        });
+
+                        successCount++;
+
+                        const progressPercentage = Math.round((i + 1) / recipients.length * 100);
+                        progressBarFill.style.width = `${progressPercentage}%`;
+                        statusText.textContent = `Sent ${i + 1} of ${recipients.length} emails...`;
+
+                        if (isTest) break;
+
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                    } catch (err) {
+                        console.error(`Error sending email to ${recipient.email}:`, err);
+                    }
+                }
+
+                statusText.textContent = isTest
+                    ? (successCount > 0 ? 'Test email sent successfully!' : 'Failed to send test email.')
+                    : `Completed: ${successCount} of ${recipients.length} emails sent successfully.`;
+            } catch (err) {
+                console.error('Error sending emails:', err);
+                statusText.textContent = 'Error: ' + err.message;
+            }
+        }
+        function validateEmail(email) {
+            const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+            return re.test(String(email).toLowerCase());
+        }
+    </script>
+</body>
+
+</html>
